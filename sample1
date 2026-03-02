@@ -1,1 +1,514 @@
-//
+package net.jpmchase.payroll.processor.service.transaction;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.math.BigDecimal;
+import java.util.*;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+/**
+ * PayrollTransactionPostProcessorService
+ *
+ * Responsibilities:
+ *  1) Handle PIM response (single / multi instruction)
+ *  2) If top-level post-processing fails AFTER response is received => CANCEL payroll (not SAF/soft)
+ *  3) Child-level: update ONLY failed instructions (receiver return code != 0 / error present)
+ *  4) Persist ONLY dirty entities (avoid updating everything)
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class PayrollTransactionPostProcessorService {
+
+    private final PayrollRepository payrollRepository;
+    private final PayrollTransactionService payrollTransactionService;
+    private final EmployeeTransactionService employeeTransactionService;
+
+    private final PayrollPersistenceService payrollPersistenceService;
+    private final PayrollTransactionPersistenceService payrollTransactionPersistenceService;
+    private final EmployeeTransactionPersistenceService employeeTransactionPersistenceService;
+
+    private static final String SYSTEM_INITIATED_CANCELLATION = "System Initiated Cancellation";
+    private static final String PARTNER_INITIATED_CANCELLATION = "Partner Initiated Cancellation";
+    private static final String UNPROCESSED = "Unprocessed";
+
+    /**
+     * Single instruction response handler.
+     *
+     * Behavior:
+     *  - If group/top-level error exists => cancel payroll
+     *  - Else run receiver-level recalculation
+     *  - If recalculation throws => cancel payroll (best-effort)
+     *  - If hierarchy can't be loaded for cancel => throw SYSTEM_RETRYABLE (SAF retry)
+     */
+    @Transactional
+    public void handlePIMResponse(final String payrollId, final InstructionResponse instructionResponse) {
+
+        // If PIM response indicates group/top-level failure, cancel immediately.
+        Optional.ofNullable(PIMErrorInterpreterUtil.getErrorForGroupFailure(instructionResponse))
+            .ifPresentOrElse(
+                pimError -> {
+                    log.info("Payroll failed at top level/sender level. Cancelling payroll. payrollId={}, code={}",
+                        payrollId, pimError.code());
+                    PayrollHierarchy hierarchy = getPayrollHierarchyOrThrowRetryable(payrollId);
+                    initiatePayrollCancellation(payrollId, hierarchy, pimError);
+                },
+                () -> {
+                    // Otherwise process receiver-level updates (selective updates)
+                    try {
+                        List<InstructionResponse> singleton = Collections.singletonList(instructionResponse);
+                        recalculatePayrollInternal(payrollId, singleton);
+                    } catch (Exception ex) {
+                        log.error("Top-level PIM post-processing failed. Cancelling payroll. payrollId={}", payrollId, ex);
+                        PayrollHierarchy hierarchy = getPayrollHierarchyOrThrowRetryable(payrollId);
+                        initiatePayrollCancellation(payrollId, hierarchy, null);
+                    }
+                }
+            );
+    }
+
+    /**
+     * Multi instruction response handler.
+     *
+     * Behavior:
+     *  - If response is null/empty => cancel payroll (since we "received response but can't process")
+     *  - Run receiver-level recalculation
+     *  - If recalculation throws => cancel payroll (best-effort)
+     *  - If hierarchy can't be loaded for cancel => throw SYSTEM_RETRYABLE (SAF retry)
+     */
+    @Transactional
+    public void handlePIMResponse(final String payrollId, final MultiInstructionResponse multiInstructionResponse) {
+
+        List<InstructionResponse> responses = Optional.ofNullable(multiInstructionResponse)
+            .map(MultiInstructionResponse::getInstructionResponses)
+            .orElse(Collections.emptyList());
+
+        if (CollectionUtils.isEmpty(responses)) {
+            log.error("PIM multi-instruction response is null/empty. Cancelling payroll. payrollId={}", payrollId);
+            PayrollHierarchy hierarchy = getPayrollHierarchyOrThrowRetryable(payrollId);
+            initiatePayrollCancellation(payrollId, hierarchy, null);
+            return;
+        }
+
+        try {
+            recalculatePayrollInternal(payrollId, responses);
+        } catch (Exception ex) {
+            log.error("Top-level PIM post-processing failed. Cancelling payroll. payrollId={}", payrollId, ex);
+            PayrollHierarchy hierarchy = getPayrollHierarchyOrThrowRetryable(payrollId);
+            initiatePayrollCancellation(payrollId, hierarchy, null);
+        }
+    }
+
+    /**
+     * Internal recalculation logic:
+     *  - Loads hierarchy
+     *  - Builds lookup maps
+     *  - Iterates instruction responses
+     *  - Updates ONLY failed receiver instructions (return code != 0 / receiver error present)
+     *  - Persists ONLY dirty entities
+     */
+    private void recalculatePayrollInternal(final String payrollId, final List<InstructionResponse> instructionResponses) {
+
+        PayrollHierarchy hierarchy = getPayrollHierarchy(payrollId);
+
+        PayrollEntity payrollEntity = hierarchy.payrollEntity();
+
+        Map<String, PayrollTransactionEntity> payrollTxnByInstrId =
+            buildPayrollTxnMap(hierarchy.payrollTransactionEntities());
+
+        Map<String, EmployeeTransactionEntity> empTxnByInstrId =
+            buildEmployeeTxnMap(hierarchy.employeeTransactionEntities());
+
+        RecalcContext ctx = new RecalcContext(payrollId, payrollEntity);
+
+        // Dirty lists (persist only what changed)
+        Set<EmployeeTransactionEntity> dirtyEmpTxns = new LinkedHashSet<>();
+        Set<PayrollTransactionEntity> dirtyPayrollTxns = new LinkedHashSet<>();
+
+        for (InstructionResponse ir : instructionResponses) {
+            processSingleInstructionSelective(ir, payrollTxnByInstrId, empTxnByInstrId, ctx, dirtyPayrollTxns, dirtyEmpTxns);
+        }
+
+        // Apply payroll-level adjustments ONLY if receiver failures exist
+        if (ctx.receiverErrorExists && ctx.totalFailedDisbursement.compareTo(BigDecimal.ZERO) > 0) {
+            applyFailedDisbursementAdjustments(payrollEntity, ctx);
+        }
+
+        // Persist ONLY dirty entities
+        persistSelective(payrollEntity, ctx, dirtyPayrollTxns, dirtyEmpTxns);
+    }
+
+    /**
+     * Process a single instruction:
+     *  - Determine receiver error / non-zero return code
+     *  - If success => DO NOTHING (don’t touch DB)
+     *  - If failure => update only that employee txn + related payroll txn (if applicable)
+     *  - Sender response updates are also selective (only when sender has error/status change)
+     */
+    private void processSingleInstructionSelective(
+        InstructionResponse ir,
+        Map<String, PayrollTransactionEntity> payrollTxnByInstrId,
+        Map<String, EmployeeTransactionEntity> empTxnByInstrId,
+        RecalcContext ctx,
+        Set<PayrollTransactionEntity> dirtyPayrollTxns,
+        Set<EmployeeTransactionEntity> dirtyEmpTxns
+    ) {
+        if (ir == null) return;
+
+        final String txnIdentifier = safe(ir::getTransactionIdentifier);
+        if (StringUtils.isBlank(txnIdentifier)) {
+            log.warn("Skipping instructionResponse with blank txnIdentifier. payrollId={}", ctx.payrollId);
+            return;
+        }
+
+        // Receiver "return code != 0" modeled as error code present
+        PIMErrorInterpreterUtil.PIMError receiverError = PIMErrorInterpreterUtil.getError(
+            ir.getPaymentRejectReasonCode(),
+            ir.getPaymentRejectReasonText(),
+            ir.getError()
+        );
+
+        boolean receiverFailed = isReceiverFailure(receiverError);
+        if (!receiverFailed) {
+            // ✅ Key requirement: do NOT update successes
+            // But you may still want to handle sender response failures for debit txns if they come separately.
+            processSenderResponseSelective(ir, payrollTxnByInstrId, dirtyPayrollTxns);
+            return;
+        }
+
+        ctx.receiverErrorExists = true;
+
+        // Update employee txn only for failed instruction
+        EmployeeTransactionEntity empTxn = empTxnByInstrId.get(txnIdentifier);
+        if (empTxn != null) {
+            markEmployeeFailure(empTxn, receiverError);
+            ctx.totalFailedDisbursement = ctx.totalFailedDisbursement.add(nvl(empTxn.getTxnAm()));
+            dirtyEmpTxns.add(empTxn);
+        } else {
+            log.warn("No EmployeeTransactionEntity found for failed txnIdentifier={}, payrollId={}",
+                txnIdentifier, ctx.payrollId);
+        }
+
+        // Update payroll txn only for failed instruction (if you map by srcPymtInstrDtlId)
+        PayrollTransactionEntity payrollTxn = payrollTxnByInstrId.get(txnIdentifier);
+        if (payrollTxn != null) {
+            markPayrollTxnFailureIfNeeded(payrollTxn, receiverError);
+            dirtyPayrollTxns.add(payrollTxn);
+        }
+
+        // Sender response updates (debit txns) are selective
+        processSenderResponseSelective(ir, payrollTxnByInstrId, dirtyPayrollTxns);
+    }
+
+    /**
+     * Selective sender response processing:
+     *  - Only update debit txns when sender response carries error OR status needs update
+     *  - Avoid touching everything
+     */
+    private void processSenderResponseSelective(
+        InstructionResponse instructionResponse,
+        Map<String, PayrollTransactionEntity> payrollTxnByInstrId,
+        Set<PayrollTransactionEntity> dirtyPayrollTxns
+    ) {
+        List<SenderResponse> senderResponses = Optional.ofNullable(instructionResponse)
+            .map(InstructionResponse::getSenderResponses)
+            .orElse(Collections.emptyList());
+
+        if (CollectionUtils.isEmpty(senderResponses)) return;
+
+        for (SenderResponse sr : senderResponses) {
+            if (sr == null) continue;
+
+            String txnIdentifier = safe(sr::getTransactionIdentifier);
+            if (StringUtils.isBlank(txnIdentifier)) continue;
+
+            PayrollTransactionEntity txn = payrollTxnByInstrId.get(txnIdentifier);
+            if (txn == null) continue;
+
+            // Only for debit transactions (as in your screenshot: crDrCd == 'D')
+            if (txn.getCrDrCd() == null || !TxnConstants.TXN_DEBIT_CRD_CD.equals(txn.getCrDrCd())) {
+                continue;
+            }
+
+            PIMErrorInterpreterUtil.PIMError senderError = PIMErrorInterpreterUtil.getError(
+                sr.getPaymentRejectReasonCode(),
+                sr.getPaymentRejectReasonText(),
+                sr.getError()
+            );
+
+            String statusNm = safe(sr::getSourcePaymentsStatusName);
+
+            boolean hasSenderError = (senderError != null && StringUtils.isNotBlank(senderError.code()));
+            boolean shouldUpdateStatus = StringUtils.isNotBlank(statusNm);
+
+            if (!hasSenderError && !shouldUpdateStatus) {
+                continue; // do not touch DB
+            }
+
+            if (hasSenderError) {
+                log.warn("Sender transaction failed for payrollId={}, pyrltxnId={}, srcPymtInstrDtlId={}, errorCode={}, errorMsg={}",
+                    instructionResponse.getTransactionIdentifier(),
+                    safe(() -> txn.getId().getPyrltxnId()),
+                    txn.getSrcPymtInstrDtlId(),
+                    senderError.code(),
+                    senderError.message()
+                );
+                txn.setErrCd(senderError.code());
+                txn.setErrDescTx(senderError.message());
+            }
+
+            if (shouldUpdateStatus) {
+                // protect terminal statuses (same pattern you have in your employee section)
+                if (!TransactionStatus.TRANSACTION_TERMINAL_STATUSES.contains(txn.getTxnStsCd())
+                    && !TransactionStatus.PENDING.getCode().equalsIgnoreCase(txn.getTxnStsCd())) {
+
+                    txn.setTxnStsCd(TransactionStatus.fromSBPStatusCode(statusNm).getCode());
+                }
+            }
+
+            dirtyPayrollTxns.add(txn);
+        }
+    }
+
+    /**
+     * Apply payroll-level adjustment for failed disbursements (only if receiver failures exist).
+     * Keep your current arithmetic here.
+     */
+    private void applyFailedDisbursementAdjustments(PayrollEntity payrollEntity, RecalcContext ctx) {
+        // This is where your existing logic goes:
+        // payrollEntity.setPyrLAM(payrollEntity.getPyrLAM().subtract(ctx.totalFailedDisbursement));
+        // payrollEntity.setSrcChkAm(payrollEntity.getSrcChkAm().add(ctx.totalFailedDisbursement));
+        //
+        // NOTE: I’m leaving it minimal because field names vary across implementations.
+        // Implement using your current logic from the existing class.
+        log.info("Applying failed disbursement adjustments. payrollId={}, totalFailed={}",
+            ctx.payrollId, ctx.totalFailedDisbursement);
+    }
+
+    /**
+     * Persist only dirty changes.
+     */
+    private void persistSelective(
+        PayrollEntity payrollEntity,
+        RecalcContext ctx,
+        Set<PayrollTransactionEntity> dirtyPayrollTxns,
+        Set<EmployeeTransactionEntity> dirtyEmpTxns
+    ) {
+        // Persist payroll entity only if receiver failures exist OR you explicitly changed payrollEntity
+        if (ctx.receiverErrorExists) {
+            payrollPersistenceService.saveWithAudit(payrollEntity);
+        }
+
+        if (!dirtyPayrollTxns.isEmpty()) {
+            payrollTransactionPersistenceService.saveAllWithAudit(new ArrayList<>(dirtyPayrollTxns));
+        }
+
+        if (!dirtyEmpTxns.isEmpty()) {
+            employeeTransactionPersistenceService.saveAllWithAudit(new ArrayList<>(dirtyEmpTxns));
+        }
+    }
+
+    /**
+     * Cancellation logic (kept very close to your screenshot).
+     */
+    @Transactional
+    public void initiatePayrollCancellation(
+        final String payrollId,
+        final PayrollHierarchy payrollHierarchy,
+        final PIMErrorInterpreterUtil.PIMError pimErrorResponse
+    ) {
+        PayrollHierarchy tuple = Optional.ofNullable(payrollHierarchy)
+            .orElseGet(() -> getPayrollHierarchy(payrollId));
+
+        PayrollEntity payrollEntity = tuple.payrollEntity();
+        List<PayrollTransactionEntity> payrollTransactionEntities = tuple.payrollTransactionEntities();
+        List<EmployeeTransactionEntity> employeeTransactionEntities = tuple.employeeTransactionEntities();
+
+        log.info("Cancelling payroll with srcPyrlId={}, processDate={}, historyIndicator={}",
+            safe(() -> payrollEntity.getId().getSrcPyrlId()),
+            safe(() -> payrollEntity.getId().getProcDt()),
+            safe(() -> payrollEntity.getId().getHistIn())
+        );
+
+        PIMErrorInterpreterUtil.PIMError pimError = Optional.ofNullable(pimErrorResponse)
+            .orElseGet(() -> new PIMErrorInterpreterUtil.PIMError(StringUtils.EMPTY, StringUtils.EMPTY));
+
+        payrollEntity.setPyrlStsCd(PayrollStatus.CANCELLATION_INITIATED.getCode());
+
+        if (StringUtils.isNotBlank(pimError.code())) {
+            payrollEntity.setErrCd(pimError.code());
+        }
+        if (StringUtils.isNotBlank(pimError.message())) {
+            payrollEntity.setErrDescTx(pimError.message());
+        }
+
+        payrollEntity.setSrcPyrlStsNm(UNPROCESSED);
+
+        // Partner vs system initiated cancellation
+        if (StringUtils.isBlank(pimError.code()) && StringUtils.isBlank(pimError.message())
+            && StringUtils.isNotBlank(payrollEntity.getStsRsnTx())) {
+            payrollEntity.setStsRsnTx(PARTNER_INITIATED_CANCELLATION);
+        } else {
+            payrollEntity.setStsRsnTx(SYSTEM_INITIATED_CANCELLATION);
+        }
+
+        payrollTransactionEntities.forEach(pt -> {
+            pt.setTxnStsCd(TransactionStatus.CANCEL_INITIATED.getCode());
+            if (StringUtils.isNotBlank(pimError.code())) {
+                pt.setErrCd(pimError.code());
+            }
+            if (StringUtils.isNotBlank(pimError.message())) {
+                pt.setErrDescTx(pimError.message());
+            }
+        });
+
+        employeeTransactionEntities.forEach(et -> {
+            et.setEmpTxnStsCd(TransactionStatus.CANCEL_INITIATED.getCode());
+            if (StringUtils.isNotBlank(pimError.code())) {
+                et.setErrCd(pimError.code());
+            }
+            if (StringUtils.isNotBlank(pimError.message())) {
+                et.setErrDescTx(pimError.message());
+            }
+        });
+
+        payrollPersistenceService.saveWithAudit(payrollEntity);
+        payrollTransactionPersistenceService.saveAllWithAudit(payrollTransactionEntities);
+        employeeTransactionPersistenceService.saveAllWithAudit(employeeTransactionEntities);
+    }
+
+    // ---------------------------
+    // Hierarchy + maps
+    // ---------------------------
+
+    public PayrollHierarchy getPayrollHierarchy(final String payrollId) {
+        log.info("Retrieving payroll hierarchy for srcPyrlId={}", payrollId);
+
+        PayrollEntity payrollEntity = payrollRepository.findBySrcPayrollId(payrollId)
+            .orElseThrow(() -> ProcessorException.of(
+                ProcessorExceptionType.BUSINESS_VALIDATION,
+                PayrollErrors.PAYROLL_RECORD_NOT_FOUND.getCode(),
+                PayrollErrors.PAYROLL_RECORD_NOT_FOUND.formatMessage(payrollId)
+            ));
+
+        List<PayrollTransactionEntity> payrollTxns = payrollTransactionService.findAllBySourcePayrollId(payrollId);
+        List<EmployeeTransactionEntity> empTxns = employeeTransactionService.findAllBySourcePayrollId(payrollId);
+
+        return new PayrollHierarchy(payrollEntity, payrollTxns, empTxns);
+    }
+
+    /**
+     * For top-level cancel: if hierarchy load fails due to infra, throw SYSTEM_RETRYABLE so SAF can retry.
+     */
+    private PayrollHierarchy getPayrollHierarchyOrThrowRetryable(final String payrollId) {
+        try {
+            return getPayrollHierarchy(payrollId);
+        } catch (ProcessorException pe) {
+            // If it's already a SYSTEM_RETRYABLE, bubble it
+            if (pe.getType() == ProcessorExceptionType.SYSTEM_RETRYABLE) {
+                throw pe;
+            }
+            // BUSINESS_VALIDATION -> this payroll truly doesn't exist: nothing to cancel, but you can decide policy.
+            // Here we rethrow as-is.
+            throw pe;
+        } catch (Exception ex) {
+            throw ProcessorException.of(
+                ProcessorExceptionType.SYSTEM_RETRYABLE,
+                PIMErrors.PIM_SERVICE_FAILED.getCode(),
+                "Unable to load payroll hierarchy for cancellation. " + PIMErrors.PIM_SERVICE_FAILED.formatMessage(payrollId)
+            );
+        }
+    }
+
+    private Map<String, PayrollTransactionEntity> buildPayrollTxnMap(List<PayrollTransactionEntity> payrollTxns) {
+        if (CollectionUtils.isEmpty(payrollTxns)) return new HashMap<>();
+        return payrollTxns.stream()
+            .filter(t -> StringUtils.isNotBlank(t.getSrcPymtInstrDtlId()))
+            .collect(Collectors.toMap(PayrollTransactionEntity::getSrcPymtInstrDtlId, Function.identity(), (a, b) -> a));
+    }
+
+    private Map<String, EmployeeTransactionEntity> buildEmployeeTxnMap(List<EmployeeTransactionEntity> empTxns) {
+        if (CollectionUtils.isEmpty(empTxns)) return new HashMap<>();
+        return empTxns.stream()
+            .filter(t -> StringUtils.isNotBlank(t.getSrcPymtInstrDtlId()))
+            .collect(Collectors.toMap(EmployeeTransactionEntity::getSrcPymtInstrDtlId, Function.identity(), (a, b) -> a));
+    }
+
+    // ---------------------------
+    // Selective update helpers
+    // ---------------------------
+
+    private boolean isReceiverFailure(PIMErrorInterpreterUtil.PIMError receiverError) {
+        return receiverError != null && StringUtils.isNotBlank(receiverError.code());
+    }
+
+    private void markEmployeeFailure(EmployeeTransactionEntity empTxn, PIMErrorInterpreterUtil.PIMError err) {
+        empTxn.setEmpTxnStsCd(TransactionStatus.FUNDING_FAILED.getCode());
+        // keep your existing behavior (you had CHECK in screenshot)
+        empTxn.setTxnModeCd(PaymentType.CHECK.getCode());
+        empTxn.setErrCd(err.code());
+        empTxn.setErrDescTx(err.message());
+    }
+
+    private void markPayrollTxnFailureIfNeeded(PayrollTransactionEntity payrollTxn, PIMErrorInterpreterUtil.PIMError err) {
+        // Only set error fields (do not overwrite terminal statuses blindly)
+        if (StringUtils.isNotBlank(err.code())) {
+            payrollTxn.setErrCd(err.code());
+        }
+        if (StringUtils.isNotBlank(err.message())) {
+            payrollTxn.setErrDescTx(err.message());
+        }
+    }
+
+    // ---------------------------
+    // Utility
+    // ---------------------------
+
+    private static BigDecimal nvl(BigDecimal v) {
+        return v == null ? BigDecimal.ZERO : v;
+    }
+
+    private static <T> T safe(SupplierWithException<T> supplier) {
+        try {
+            return supplier.get();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    @FunctionalInterface
+    private interface SupplierWithException<T> {
+        T get() throws Exception;
+    }
+
+    private static final class RecalcContext {
+        private final String payrollId;
+        private final PayrollEntity payrollEntity;
+
+        private boolean receiverErrorExists = false;
+        private BigDecimal totalFailedDisbursement = BigDecimal.ZERO;
+
+        private RecalcContext(String payrollId, PayrollEntity payrollEntity) {
+            this.payrollId = payrollId;
+            this.payrollEntity = payrollEntity;
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // NOTE:
+    // The below types are referenced from your project. Keep them as-is:
+    //   - PayrollRepository / PayrollTransactionService / EmployeeTransactionService
+    //   - PayrollPersistenceService / PayrollTransactionPersistenceService / EmployeeTransactionPersistenceService
+    //   - PayrollHierarchy / PayrollEntity / PayrollTransactionEntity / EmployeeTransactionEntity
+    //   - InstructionResponse / MultiInstructionResponse / SenderResponse
+    //   - PIMErrorInterpreterUtil / ProcessorException / ProcessorExceptionType
+    //   - PayrollStatus / TransactionStatus / PaymentType / TxnConstants
+    //   - PayrollErrors / PIMErrors
+    // ----------------------------------------------------------------------
+}
