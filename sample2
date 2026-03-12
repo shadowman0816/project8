@@ -1,0 +1,471 @@
+package net.jpmchase.payroll.processor.service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import net.jpmchase.payroll.processor.config.StepConfig;
+import net.jpmchase.payroll.processor.config.WorkFlowRegistry;
+import net.jpmchase.payroll.processor.exception.ExceptionClassifierUtil;
+import net.jpmchase.payroll.processor.exception.ProcessorException;
+import net.jpmchase.payroll.processor.exception.ProcessorExceptionType;
+import net.jpmchase.payroll.processor.model.Event;
+import net.jpmchase.payroll.processor.model.WorkflowContext;
+import net.jpmchase.payroll.processor.step.Condition;
+import net.jpmchase.payroll.processor.step.Step;
+import net.jpmchase.payroll.processor.util.WorkflowStatus;
+import org.springframework.stereotype.Service;
+
+import java.util.Map;
+
+import static net.jpmchase.payroll.processor.constant.ContextConstants.CANCEL_GUSTO_PAYMENT;
+import static net.jpmchase.payroll.processor.constant.ContextConstants.CANCEL_GUSTO_PAYROLL;
+import static net.jpmchase.payroll.processor.constant.ContextConstants.GUSTO_EVENTID;
+import static net.jpmchase.payroll.processor.constant.ContextConstants.STEP_NAME;
+import static net.jpmchase.payroll.processor.util.WorkflowStatus.COMPLETED;
+import static net.jpmchase.payroll.processor.util.WorkflowStatus.FAILED;
+import static net.jpmchase.payroll.processor.util.WorkflowStatus.SUCCESS;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class StepProcessorService {
+
+    private static final String UNKNOWN = "Unknown";
+    private static final String HANDLER_FAILURE_STEP = "HANDLER_FAILURE_STEP";
+    private static final String HANDLER_FAILURE_REASON = "HANDLER_FAILURE_REASON";
+    private static final String ORIGINAL_EXCEPTION_TYPE = "ORIGINAL_EXCEPTION_TYPE";
+    private static final String ORIGINAL_EXCEPTION_MESSAGE = "ORIGINAL_EXCEPTION_MESSAGE";
+
+    private final WorkFlowRegistry workFlowRegistry;
+    private final Map<String, Step> stepRegistry;
+    private final Map<String, Condition> conditionRegistry;
+    private final SystemRetryableService systemRetryableService;
+    private final SafService safService;
+
+    public void executeStepWithRetry(final StepConfig stepConfig,
+                                     final WorkflowContext context,
+                                     final Event event) {
+
+        int retryCount = 0;
+        final String stepName = stepConfig.getName();
+        context.put(STEP_NAME, stepName);
+
+        int maxRetries = getMaxRetries(stepConfig, stepName, context);
+
+        log.info("[PROCESSOR] Executing step '{}' (Attempt {}/{}) for SRC Event ID: {}",
+                stepName, retryCount + 1, maxRetries + 1, getEventId(context));
+
+        final Step stepExecutor = stepRegistry.get(stepName);
+        if (stepExecutor == null) {
+            log.warn("[PROCESSOR] Step '{}' not found in registry. Skipping for SRC Event ID: {}.",
+                    stepName, getEventId(context));
+            context.setStatus(SUCCESS);
+            return;
+        }
+
+        try {
+            if (shouldSkipForSaf(stepName, event, context)) {
+                log.info("[PROCESSOR] Skipping step '{}' due to SAF condition for SRC Event ID: {}.",
+                        stepName, getEventId(context));
+                context.setStatus(SUCCESS);
+                return;
+            }
+
+            if (!shouldExecute(stepConfig, context)) {
+                log.info("[PROCESSOR] Skipping step '{}' due to failed condition evaluation for SRC Event ID: {}.",
+                        stepName, getEventId(context));
+                context.setStatus(SUCCESS);
+                return;
+            }
+
+            final boolean retryEnabled = stepConfig.isRetryEnabled();
+            maxRetries = retryEnabled ? maxRetries : 0;
+
+            while (retryCount <= maxRetries) {
+                try {
+                    stepExecutor.execute(context);
+                    context.setStatus(SUCCESS);
+
+                    log.info("[PROCESSOR] Step '{}' executed successfully on attempt {}/{} for SRC Event ID: {}",
+                            stepName, retryCount + 1, maxRetries + 1, getEventId(context));
+                    return;
+
+                } catch (Exception executionException) {
+                    final ProcessorException classified = classify(executionException, stepName, context);
+                    retryCount++;
+
+                    if (handleBusinessValidationException(classified, stepConfig, context, stepName, retryCount, maxRetries)) {
+                        return;
+                    }
+
+                    log.warn("[PROCESSOR] Step '{}' failed on attempt {}/{}. Retrying if eligible. "
+                                    + "Reason: {}. SRC Event ID: {}",
+                            stepName,
+                            retryCount,
+                            maxRetries + 1,
+                            getMessage(classified),
+                            getEventId(context),
+                            executionException);
+
+                    if (retryCount > maxRetries) {
+                        processException(stepConfig, context, classified, stepName, retryCount, maxRetries);
+                        return;
+                    }
+                }
+            }
+        } catch (Exception frameworkException) {
+            log.error("[PROCESSOR] Fatal framework error while executing step '{}' for SRC Event ID: {}",
+                    stepName, getEventId(context), frameworkException);
+            handleFrameworkFailure(context, stepName, frameworkException);
+        }
+    }
+
+    private int getMaxRetries(final StepConfig stepConfig,
+                              final String stepName,
+                              final WorkflowContext context) {
+        try {
+            return workFlowRegistry.getRetryCountForStep(stepConfig);
+        } catch (Exception ex) {
+            log.error("[PROCESSOR] Failed to resolve retry count for step '{}' for SRC Event ID: {}. Defaulting to 0.",
+                    stepName, getEventId(context), ex);
+            return 0;
+        }
+    }
+
+    private boolean shouldSkipForSaf(final String stepName,
+                                     final Event event,
+                                     final WorkflowContext context) {
+        try {
+            return safService.shouldExecuteStep(stepName, event, context);
+        } catch (Exception ex) {
+            log.error("[PROCESSOR] Failed while evaluating SAF condition for step '{}' for SRC Event ID: {}. "
+                            + "Proceeding with normal execution.",
+                    stepName, getEventId(context), ex);
+            return false;
+        }
+    }
+
+    private boolean shouldExecute(final StepConfig stepConfig, final WorkflowContext context) {
+        final String conditionName = stepConfig.getExecuteOnCondition();
+
+        if (conditionName == null || "always".equalsIgnoreCase(conditionName)) {
+            return true;
+        }
+
+        try {
+            final Condition condition = conditionRegistry.get(conditionName);
+            if (condition == null) {
+                log.warn("[PROCESSOR] No condition bean found for '{}'. Skipping execution.", conditionName);
+                return false;
+            }
+            return condition.evaluate(context);
+        } catch (Exception ex) {
+            log.error("[PROCESSOR] Failed to evaluate condition '{}' for SRC Event ID: {}. Error: {}",
+                    conditionName, getEventId(context), ex.getMessage(), ex);
+            return false;
+        }
+    }
+
+    private ProcessorException classify(final Exception ex,
+                                        final String stepName,
+                                        final WorkflowContext context) {
+        try {
+            return (ex instanceof ProcessorException)
+                    ? (ProcessorException) ex
+                    : ExceptionClassifierUtil.classify(ex, stepName);
+        } catch (Exception classificationException) {
+            log.error("[PROCESSOR] Failed to classify exception in step '{}' for SRC Event ID: {}. "
+                            + "Defaulting to FATAL.",
+                    stepName, getEventId(context), classificationException);
+
+            return buildFallbackProcessorException(stepName, ex, classificationException);
+        }
+    }
+
+    private boolean handleBusinessValidationException(final ProcessorException classified,
+                                                      final StepConfig stepConfig,
+                                                      final WorkflowContext context,
+                                                      final String stepName,
+                                                      final int retryCount,
+                                                      final int maxRetries) {
+        try {
+            if (classified.getType() == ProcessorExceptionType.BUSINESS_VALIDATION) {
+                log.warn("[PROCESSOR] Step '{}' failed with BUSINESS_VALIDATION on attempt {}/{}. "
+                                + "Skipping further retries. SRC Event ID: {}",
+                        stepName, retryCount, maxRetries + 1, getEventId(context));
+
+                processException(stepConfig, context, classified, stepName, retryCount, maxRetries);
+                return true;
+            }
+            return false;
+        } catch (Exception ex) {
+            log.error("[PROCESSOR] Failed while processing BUSINESS_VALIDATION for step '{}' and SRC Event ID: {}",
+                    stepName, getEventId(context), ex);
+
+            handleExceptionFailure(context, stepName, classified, ex);
+            return true;
+        }
+    }
+
+    private void processException(final StepConfig stepConfig,
+                                  final WorkflowContext context,
+                                  final ProcessorException ex,
+                                  final String stepName,
+                                  final int retryCount,
+                                  final int maxRetries) {
+        try {
+            handleException(stepConfig, context, ex, stepName, retryCount, maxRetries);
+        } catch (Exception handlerException) {
+            log.error("[PROCESSOR] Exception occurred while handling exception in step '{}' for SRC Event ID: {}. "
+                            + "Original exception type: {}, original message: {}",
+                    stepName,
+                    getEventId(context),
+                    ex != null ? ex.getType() : null,
+                    ex != null ? ex.getMessage() : null,
+                    handlerException);
+
+            handleExceptionFailure(context, stepName, ex, handlerException);
+        }
+    }
+
+    private void handleException(final StepConfig stepConfig,
+                                 final WorkflowContext context,
+                                 final ProcessorException ex,
+                                 final String stepName,
+                                 final int retryCount,
+                                 final int maxRetries) {
+
+        final String failureReason = String.format(
+                "Step '%s' failed (Attempt %d/%d). Failure Reason: %s",
+                stepName,
+                retryCount,
+                maxRetries + 1,
+                ex != null ? getMessage(ex) : UNKNOWN
+        );
+
+        if (ex == null || ex.getType() == null) {
+            setCancelInGusto(context);
+            context.setStatus(SUCCESS);
+            log.error("[PROCESSOR] Unknown error type in step '{}' for SRC Event ID: {}",
+                    stepName, getEventId(context), ex);
+            return;
+        }
+
+        switch (ex.getType()) {
+
+            case FATAL:
+                context.setStatus(FAILED);
+                log.error("[PROCESSOR] Fatal error in step '{}' for SRC Event ID: {}. Exception: {}",
+                        stepName, getEventId(context), getMessage(ex), ex);
+                return;
+
+            case BUSINESS_VALIDATION:
+                setCancelInGusto(context);
+                context.setStatus(SUCCESS);
+                log.warn("[PROCESSOR] Business validation failed in step '{}' for SRC Event ID: {}. Exception: {}",
+                        stepName, getEventId(context), getMessage(ex), ex);
+                return;
+
+            case SYSTEM_RETRYABLE:
+                handleSystemRetryable(stepConfig, context, stepName, failureReason, ex);
+                return;
+
+            case SKIPPABLE:
+                context.setStatus(SUCCESS);
+                log.warn("[PROCESSOR] Skippable error occurred in step '{}' for SRC Event ID: {}. Exception: {}",
+                        stepName, getEventId(context), getMessage(ex), ex);
+                return;
+
+            case FLOW_HALT:
+                context.setStatus(COMPLETED);
+                log.warn("[PROCESSOR] Flow halted intentionally in step '{}' for SRC Event ID: {}. Exception: {}",
+                        stepName, getEventId(context), getMessage(ex), ex);
+                return;
+
+            case SILENT_WARNING:
+                markEventProcessedWithException(stepConfig, context, failureReason, stepName, ex);
+                context.setStatus(SUCCESS);
+                log.warn("[PROCESSOR] Silent warning in step '{}' for SRC Event ID: {}. Exception: {}",
+                        stepName, getEventId(context), getMessage(ex), ex);
+                return;
+
+            case FLOW_HALT_NO_SAF:
+                updateSafToSkipped(context, stepName, ex);
+                context.setStatus(COMPLETED);
+                log.warn("[PROCESSOR] Flow halted intentionally without SAF in step '{}' for SRC Event ID: {}. Exception: {}",
+                        stepName, getEventId(context), getMessage(ex), ex);
+                return;
+
+            default:
+                setCancelInGusto(context);
+                context.setStatus(SUCCESS);
+                log.error("[PROCESSOR] Unsupported error type '{}' in step '{}' for SRC Event ID: {}",
+                        ex.getType(), stepName, getEventId(context), ex);
+        }
+    }
+
+    private void handleSystemRetryable(final StepConfig stepConfig,
+                                       final WorkflowContext context,
+                                       final String stepName,
+                                       final String failureReason,
+                                       final ProcessorException originalException) {
+        try {
+            if (systemRetryableService.shouldCancelInsteadOfReplayed(stepConfig, context)) {
+                log.error("[PROCESSOR] System exception received after cut-off in step '{}'. "
+                                + "Cancelling in Gusto for SRC Event ID: {}. Exception: {}",
+                        stepName, getEventId(context), getMessage(originalException), originalException);
+
+                setCancelInGusto(context);
+                context.setStatus(SUCCESS);
+                return;
+            }
+
+            if (stepConfig.isSafEnabled()) {
+                log.error("[PROCESSOR] System-retryable exception in step '{}'. Creating SAF entry for SRC Event ID: {}. "
+                                + "Exception: {}",
+                        stepName, getEventId(context), getMessage(originalException), originalException);
+
+                systemRetryableService.createSystemRetryableEntry(stepConfig, context, failureReason);
+            }
+
+            context.setStatus(FAILED);
+
+        } catch (Exception handlerException) {
+            log.error("[PROCESSOR] Failed during SYSTEM_RETRYABLE handling in step '{}' for SRC Event ID: {}. "
+                            + "Original exception: {}",
+                    stepName, getEventId(context), getMessage(originalException), handlerException);
+
+            enrichContextWithHandlerFailure(context, stepName, originalException, handlerException);
+            context.setStatus(FAILED);
+        }
+    }
+
+    private void setCancelInGusto(final WorkflowContext context) {
+        try {
+            if (context != null) {
+                context.put(CANCEL_GUSTO_PAYROLL, Boolean.TRUE);
+                context.put(CANCEL_GUSTO_PAYMENT, Boolean.TRUE);
+            }
+        } catch (Exception ex) {
+            log.error("[PROCESSOR] Failed to set cancel-in-Gusto flags on workflow context.", ex);
+        }
+    }
+
+    private void markEventProcessedWithException(final StepConfig stepConfig,
+                                                 final WorkflowContext context,
+                                                 final String failureReason,
+                                                 final String stepName,
+                                                 final ProcessorException originalException) {
+        try {
+            systemRetryableService.markEventAsProcessedWithException(stepConfig, context, failureReason);
+        } catch (Exception ex) {
+            log.error("[PROCESSOR] Failed to mark event as processed with exception for step '{}' and SRC Event ID: {}. "
+                            + "Original exception: {}",
+                    stepName,
+                    getEventId(context),
+                    getMessage(originalException),
+                    ex);
+        }
+    }
+
+    private void updateSafToSkipped(final WorkflowContext context,
+                                    final String stepName,
+                                    final ProcessorException originalException) {
+        try {
+            systemRetryableService.updateSAFIfPresentToSkipped(context.get(GUSTO_EVENTID, String.class));
+        } catch (Exception ex) {
+            log.error("[PROCESSOR] Failed to update SAF entry to skipped for step '{}' and SRC Event ID: {}. "
+                            + "Original exception: {}",
+                    stepName,
+                    getEventId(context),
+                    getMessage(originalException),
+                    ex);
+        }
+    }
+
+    private void handleExceptionFailure(final WorkflowContext context,
+                                        final String stepName,
+                                        final ProcessorException originalException,
+                                        final Exception handlerException) {
+        try {
+            enrichContextWithHandlerFailure(context, stepName, originalException, handlerException);
+            if (context != null) {
+                context.setStatus(FAILED);
+            }
+        } catch (Exception fallbackException) {
+            log.error("[PROCESSOR] Fallback handling also failed for step '{}'.", stepName, fallbackException);
+        }
+    }
+
+    private void handleFrameworkFailure(final WorkflowContext context,
+                                        final String stepName,
+                                        final Exception frameworkException) {
+        try {
+            if (context != null) {
+                context.put(HANDLER_FAILURE_STEP, stepName);
+                context.put(HANDLER_FAILURE_REASON, getMessage(frameworkException));
+                context.setStatus(FAILED);
+            }
+        } catch (Exception fallbackException) {
+            log.error("[PROCESSOR] Framework fallback also failed for step '{}'.", stepName, fallbackException);
+        }
+    }
+
+    private void enrichContextWithHandlerFailure(final WorkflowContext context,
+                                                 final String stepName,
+                                                 final ProcessorException originalException,
+                                                 final Exception handlerException) {
+        try {
+            if (context != null) {
+                context.put(HANDLER_FAILURE_STEP, stepName);
+                context.put(HANDLER_FAILURE_REASON, getMessage(handlerException));
+                context.put(ORIGINAL_EXCEPTION_TYPE,
+                        originalException != null && originalException.getType() != null
+                                ? originalException.getType().name()
+                                : UNKNOWN);
+                context.put(ORIGINAL_EXCEPTION_MESSAGE,
+                        originalException != null ? getMessage(originalException) : UNKNOWN);
+            }
+        } catch (Exception contextException) {
+            log.error("[PROCESSOR] Failed to enrich context with handler failure details for step '{}'.",
+                    stepName, contextException);
+        }
+    }
+
+    private ProcessorException buildFallbackProcessorException(final String stepName,
+                                                               final Exception originalException,
+                                                               final Exception classificationException) {
+        try {
+            return new ProcessorException(
+                    ProcessorExceptionType.FATAL,
+                    "EXCEPTION_CLASSIFICATION_FAILED",
+                    "Failed to classify exception for step '" + stepName
+                            + "'. Original exception: "
+                            + (originalException != null ? originalException.getMessage() : UNKNOWN),
+                    classificationException
+            );
+        } catch (Exception ex) {
+            log.error("[PROCESSOR] Failed to construct fallback ProcessorException for step '{}'.", stepName, ex);
+            throw new RuntimeException("Unable to construct fallback ProcessorException", ex);
+        }
+    }
+
+    private String getEventId(final WorkflowContext context) {
+        try {
+            if (context == null) {
+                return UNKNOWN;
+            }
+            final Object eventId = context.get(GUSTO_EVENTID);
+            return eventId != null ? String.valueOf(eventId) : UNKNOWN;
+        } catch (Exception ex) {
+            return UNKNOWN;
+        }
+    }
+
+    private String getMessage(final Exception ex) {
+        try {
+            return ex != null && ex.getMessage() != null ? ex.getMessage() : UNKNOWN;
+        } catch (Exception ignore) {
+            return UNKNOWN;
+        }
+    }
+}
