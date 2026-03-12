@@ -1,0 +1,66 @@
+:::writing{variant=“email” id=“91547” subject=“RE: Job failure alert for RECON”}
+Hi Jude,
+
+Thanks for raising this. I agree that proper visibility into RECON job execution is important.
+
+Just to reiterate what I mentioned during the discussion earlier today, the RECON tasklet emits deterministic execution logs for every run, including cases where there are no payroll updates in the evaluated window.
+
+For example, during execution the job logs messages such as:
+
+[PayrollRecon] Batch partition processing window: Start={}, End={}
+[PayrollRecon] No payroll updates on window {} -> {}
+[PayrollRecon] window {}->{} payrolls={} processed={} discrepancies={}
+
+Because of this behavior, the alerting logic can be defined using two clear conditions.
+
+⸻
+
+1. Missing Execution Signal (within 15 minutes)
+
+The RECON job runs hourly, and during each execution it should emit at least one of the [PayrollRecon] logs above. Even when there are no payroll updates, the job still logs the window it evaluated.
+
+Therefore, if none of the expected execution logs appear within 15 minutes of the scheduled run, it would indicate that the job started but did not progress to a valid execution state, which should trigger an alert.
+
+Example Splunk query pattern:
+
+index=<index_name>
+"[PayrollRecon]"
+| stats latest(_time) as lastSeen
+| eval delay=now()-lastSeen
+| where delay > 900
+
+
+⸻
+
+2. Runtime Exception / Job Failure
+
+Independently of the above condition, any runtime exception during job execution should also raise an alert.
+
+Example query:
+
+index=<index_name>
+(level=ERROR OR level=FATAL)
+(Exception OR error)
+
+or
+
+index=<index_name>
+"[PayrollRecon]" AND (Exception OR ERROR)
+
+
+⸻
+
+So the intended behavior is:
+
+• Valid run with payroll updates → execution log present → no alert
+• Valid run with no payroll updates → execution log present → no alert
+• Job runs but no execution signal within 15 minutes → alert
+• Any runtime exception during execution → alert
+
+This aligns with the behavior discussed earlier today and ensures we avoid false alerts when there are simply no payroll updates to process.
+
+If helpful, I can reproduce both scenarios in the lower environment (a no-data run and a forced exception) so we can validate the alert behavior before enabling it in PROD.
+
+Thanks,
+Kasi
+:::
