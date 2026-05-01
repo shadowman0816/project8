@@ -1,5 +1,76 @@
 package net.jpmchase.payroll.processor.common.parallel;
 
+import lombok.Builder;
+import lombok.Getter;
+
+import java.util.function.Supplier;
+
+@Getter
+@Builder
+public class ParallelTask<T> {
+
+    private final String name;
+    private final Class<T> responseType;
+    private final Supplier<T> supplier;
+
+    public static <T> ParallelTask<T> of(
+            final String name,
+            final Class<T> responseType,
+            final Supplier<T> supplier
+    ) {
+        return ParallelTask.<T>builder()
+                .name(name)
+                .responseType(responseType)
+                .supplier(supplier)
+                .build();
+    }
+}
+
+package net.jpmchase.payroll.processor.common.parallel;
+
+import net.jpmchase.payroll.processor.exception.ProcessorException;
+import net.jpmchase.payroll.processor.exception.ProcessorExceptionType;
+
+import java.util.Collections;
+import java.util.Map;
+
+public class ParallelTaskResult {
+
+    private final Map<String, Object> results;
+
+    public ParallelTaskResult(final Map<String, Object> results) {
+        this.results = Collections.unmodifiableMap(results);
+    }
+
+    public <T> T get(final String taskName, final Class<T> responseType) {
+        final Object value = results.get(taskName);
+
+        if (value == null) {
+            throw ProcessorException.of(
+                    ProcessorExceptionType.INFRA_RETRYABLE,
+                    "PARALLEL_TASK_RESULT_NOT_FOUND",
+                    "Parallel task result not found for taskName=" + taskName
+            );
+        }
+
+        if (!responseType.isInstance(value)) {
+            throw ProcessorException.of(
+                    ProcessorExceptionType.INFRA_RETRYABLE,
+                    "PARALLEL_TASK_RESULT_TYPE_MISMATCH",
+                    "Parallel task result type mismatch for taskName=" + taskName
+            );
+        }
+
+        return responseType.cast(value);
+    }
+
+    public Map<String, Object> asMap() {
+        return results;
+    }
+}
+
+package net.jpmchase.payroll.processor.common.parallel;
+
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import net.jpmchase.payroll.processor.exception.ProcessorException;
@@ -8,10 +79,14 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executor;
-import java.util.function.Supplier;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Component
@@ -23,39 +98,46 @@ public class ParallelTaskExecutor {
 
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(20);
 
-    public <T1, T2> ParallelResult2<T1, T2> execute(
-            final String task1Name,
-            final Supplier<T1> task1,
-            final String task2Name,
-            final Supplier<T2> task2
-    ) {
-        return execute(task1Name, task1, task2Name, task2, DEFAULT_TIMEOUT);
+    public ParallelTaskResult execute(final Collection<ParallelTask<?>> tasks) {
+        return execute(tasks, DEFAULT_TIMEOUT);
     }
 
-    public <T1, T2> ParallelResult2<T1, T2> execute(
-            final String task1Name,
-            final Supplier<T1> task1,
-            final String task2Name,
-            final Supplier<T2> task2,
+    public ParallelTaskResult execute(
+            final Collection<ParallelTask<?>> tasks,
             final Duration timeout
     ) {
-        final CompletableFuture<T1> future1 = CompletableFuture.supplyAsync(
-                () -> executeTask(task1Name, task1),
-                payrollParallelExecutor
-        );
+        validateTasks(tasks);
 
-        final CompletableFuture<T2> future2 = CompletableFuture.supplyAsync(
-                () -> executeTask(task2Name, task2),
-                payrollParallelExecutor
-        );
+        final Map<String, CompletableFuture<Object>> futures = tasks.stream()
+                .collect(Collectors.toMap(
+                        ParallelTask::getName,
+                        task -> CompletableFuture.supplyAsync(
+                                () -> executeTask(task),
+                                payrollParallelExecutor
+                        ),
+                        (existing, duplicate) -> {
+                            throw ProcessorException.of(
+                                    ProcessorExceptionType.INFRA_RETRYABLE,
+                                    "DUPLICATE_PARALLEL_TASK_NAME",
+                                    "Duplicate parallel task name found"
+                            );
+                        },
+                        LinkedHashMap::new
+                ));
 
         try {
             CompletableFuture
-                    .allOf(future1, future2)
-                    .orTimeout(timeout.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)
+                    .allOf(futures.values().toArray(new CompletableFuture[0]))
+                    .orTimeout(timeout.toMillis(), TimeUnit.MILLISECONDS)
                     .join();
 
-            return new ParallelResult2<>(future1.join(), future2.join());
+            final Map<String, Object> results = new LinkedHashMap<>();
+
+            for (Map.Entry<String, CompletableFuture<Object>> entry : futures.entrySet()) {
+                results.put(entry.getKey(), entry.getValue().join());
+            }
+
+            return new ParallelTaskResult(results);
 
         } catch (CompletionException ex) {
             throw unwrap(ex);
@@ -69,15 +151,79 @@ public class ParallelTaskExecutor {
         }
     }
 
-    private <T> T executeTask(final String taskName, final Supplier<T> supplier) {
+    private Object executeTask(final ParallelTask<?> task) {
         try {
-            log.info("[PARALLEL] Starting task={}", taskName);
-            T result = supplier.get();
-            log.info("[PARALLEL] Completed task={}", taskName);
+            log.info("[PARALLEL] Starting task={}", task.getName());
+
+            final Object result = task.getSupplier().get();
+
+            if (result == null) {
+                throw ProcessorException.of(
+                        ProcessorExceptionType.INFRA_RETRYABLE,
+                        "PARALLEL_TASK_RETURNED_NULL",
+                        "Parallel task returned null for taskName=" + task.getName()
+                );
+            }
+
+            if (!task.getResponseType().isInstance(result)) {
+                throw ProcessorException.of(
+                        ProcessorExceptionType.INFRA_RETRYABLE,
+                        "PARALLEL_TASK_RESPONSE_TYPE_MISMATCH",
+                        "Parallel task returned invalid type for taskName=" + task.getName()
+                );
+            }
+
+            log.info("[PARALLEL] Completed task={}", task.getName());
+
             return result;
+
         } catch (Exception ex) {
-            log.error("[PARALLEL] Failed task={}", taskName, ex);
+            log.error("[PARALLEL] Failed task={}", task.getName(), ex);
             throw new CompletionException(ex);
+        }
+    }
+
+    private void validateTasks(final Collection<ParallelTask<?>> tasks) {
+        if (tasks == null || tasks.isEmpty()) {
+            throw ProcessorException.of(
+                    ProcessorExceptionType.INFRA_RETRYABLE,
+                    "NO_PARALLEL_TASKS_PROVIDED",
+                    "No parallel tasks were provided"
+            );
+        }
+
+        for (ParallelTask<?> task : tasks) {
+            if (task == null) {
+                throw ProcessorException.of(
+                        ProcessorExceptionType.INFRA_RETRYABLE,
+                        "NULL_PARALLEL_TASK",
+                        "Null parallel task was provided"
+                );
+            }
+
+            if (task.getName() == null || task.getName().isBlank()) {
+                throw ProcessorException.of(
+                        ProcessorExceptionType.INFRA_RETRYABLE,
+                        "INVALID_PARALLEL_TASK_NAME",
+                        "Parallel task name is missing"
+                );
+            }
+
+            if (task.getResponseType() == null) {
+                throw ProcessorException.of(
+                        ProcessorExceptionType.INFRA_RETRYABLE,
+                        "INVALID_PARALLEL_TASK_RESPONSE_TYPE",
+                        "Parallel task response type is missing for taskName=" + task.getName()
+                );
+            }
+
+            if (task.getSupplier() == null) {
+                throw ProcessorException.of(
+                        ProcessorExceptionType.INFRA_RETRYABLE,
+                        "INVALID_PARALLEL_TASK_SUPPLIER",
+                        "Parallel task supplier is missing for taskName=" + task.getName()
+                );
+            }
         }
     }
 
@@ -105,327 +251,30 @@ public class ParallelTaskExecutor {
     }
 }
 
-package net.jpmchase.payroll.processor.common.parallel;
-
-public record ParallelResult2<T1, T2>(
-        T1 first,
-        T2 second
-) {
-}
-
-package net.jpmchase.payroll.processor.common.parallel;
-
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
-
-import java.util.concurrent.Executor;
-
-@Configuration
-public class PayrollParallelExecutorConfig {
-
-    @Bean(name = "payrollParallelExecutor")
-    public Executor payrollParallelExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-
-        executor.setThreadNamePrefix("payroll-parallel-");
-
-        executor.setCorePoolSize(5);
-        executor.setMaxPoolSize(20);
-        executor.setQueueCapacity(100);
-
-        executor.setWaitForTasksToCompleteOnShutdown(true);
-        executor.setAwaitTerminationSeconds(30);
-
-        executor.initialize();
-        return executor;
-    }
-}
-
-private final ParallelTaskExecutor parallelTaskExecutor;
-
-@Component("validateCustomerInternalEligibility")
-@RequiredArgsConstructor
-@Slf4j
-public class CustomerInternalEligibilityValidationStep implements Step {
-
-    private final CustomerConfigurationService customerConfigurationService;
-    private final LimitUtilityService limitUtilityService;
-    private final ParallelTaskExecutor parallelTaskExecutor;
-
-    @Override
-    public void execute(final WorkflowContext context) {
-
-        final Boolean cancelGustoPayroll = context.get(CANCEL_GUSTO_PAYROLL, Boolean.class);
-        if (Boolean.TRUE.equals(cancelGustoPayroll)) {
-            log.info("[PROCESSOR] Skipping step ValidateCustomerInternalEligibility due to failed condition evaluation.");
-            return;
-        }
-
-        final String companyId = context.get(COMPANY_UUID, String.class);
-        final EnrollmentEntity enrollmentEntity = context.get(COMPANY_ENROLLMENT, EnrollmentEntity.class);
-        final GetPayrollResponse payrollResponse = context.get(GUSTO_SINGLE_PAYROLL, GetPayrollResponse.class);
-        final PayrollEntity payrollEntity = context.get(PAYROLL_ENTITY, PayrollEntity.class);
-        final String payrollId = context.get(PYRL_UUID, String.class);
-
-        validateRequiredContext(companyId, enrollmentEntity, payrollResponse, payrollEntity, payrollId);
-
-        final Long profileId = payrollEntity.getSbmtPrtyOlPrflId();
-
-        if (profileId == null || profileId <= 0L) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    INVALID_PROFILE_ID.getCode(),
-                    INVALID_PROFILE_ID.getMessage()
-            );
-        }
-
-        final String payrollEnrollmentId = payrollEntity.getPyrlEnrlId();
-
-        final String procDate = payrollResponse
-                .getPayrollStatusMeta()
-                .getExpectedDebitTime();
-
-        final String segmentCode = payrollEntity.getSegmentCode(); 
-        // Replace getSegmentCode() with your actual PayrollEntity field/method name.
-
-        if (segmentCode == null || segmentCode.isBlank()) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "INVALID_SEGMENT_CODE",
-                    "Payroll segment code is missing for payrollId=" + payrollId
-            );
-        }
-
-        log.info(
-                "[STEP] Validating internal eligibility and limits for companyId={}, profileId={}, payrollId={}, segmentCode={}",
-                companyId,
-                profileId,
-                payrollId,
-                segmentCode
-        );
-
-        final ParallelResult2<PaymentCustomerEligibilityResponse, ProfileLimit> parallelResult =
-                parallelTaskExecutor.execute(
-                        "validatePartyAndAccount",
-                        () -> customerConfigurationService.validatePartyAndAccount(
-                                enrollmentEntity,
-                                companyId,
-                                profileId,
-                                procDate
-                        ),
-                        "getSegmentLimit",
-                        () -> limitUtilityService.getSegmentLimit(
-                                segmentCode,
-                                AppConstants.PAYROLL
-                        )
-                );
-
-        final PaymentCustomerEligibilityResponse eligibilityResponse = parallelResult.first();
-        final ProfileLimit profileLimit = parallelResult.second();
-
-        validateEligibilityResponse(eligibilityResponse);
-        validateProfileLimit(profileLimit);
-
-        context.put(ACTOR_ENTP_PRPTY_ID, eligibilityResponse.getEnterprisePartyIdentifier());
-        context.put(USER_SEGMENT_IDENTIFIER, eligibilityResponse.getUserSegmentIdentifier());
-        context.put(ELIGIBILITY_RESPONSE, eligibilityResponse);
-
-        validateTransactionLimit(companyId, profileId, payrollResponse, profileLimit);
-
-        validateDailyLimit(
-                companyId,
-                profileId,
-                payrollEnrollmentId,
-                procDate,
-                profileLimit
-        );
-
-        loadContextWithLimit(context, profileLimit, profileLimit.getDailyLimit());
-
-        log.info("[STEP] Customer eligibility and limit validation passed for companyId={}", companyId);
-    }
-
-    private void validateTransactionLimit(
-            final String companyId,
-            final Long profileId,
-            final GetPayrollResponse payrollResponse,
-            final ProfileLimit profileLimit
-    ) {
-        final BigDecimal currentDebitAmount =
-                new BigDecimal(payrollResponse.getTotals().getCompanyDebit());
-
-        if (currentDebitAmount.compareTo(profileLimit.getTransactionLimit()) > 0) {
-            log.warn(
-                    "[STEP] Transaction limit exceeded for companyId={}, profileId={}",
-                    companyId,
-                    profileId
-            );
-
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    TRANSACTION_LIMIT_EXCEEDED.getCode(),
-                    TRANSACTION_LIMIT_EXCEEDED.getMessage()
-            );
-        }
-    }
-
-    private void validateDailyLimit(
-            final String companyId,
-            final Long profileId,
-            final String payrollEnrollmentId,
-            final String procDate,
-            final ProfileLimit profileLimit
-    ) {
-        final BigDecimal totalAmount =
-                customerConfigurationService.getAggregatedTotalAmount(
-                        payrollEnrollmentId,
+final ParallelTaskResult parallelResult = parallelTaskExecutor.execute(List.of(
+        ParallelTask.of(
+                "customerEligibility",
+                CustomerEligibilityValidationResult.class,
+                () -> customerConfigurationService.validatePartyAndAccount(
+                        enrollmentEntity,
+                        companyId,
+                        profileId,
                         procDate
-                );
+                )
+        ),
+        ParallelTask.of(
+                "profileLimit",
+                ProfileLimit.class,
+                () -> limitUtilityService.getSegmentLimit(
+                        payrollEntity.getSegmentCode(),
+                        AppConstants.PAYROLL
+                )
+        )
+));
 
-        if (totalAmount.compareTo(profileLimit.getDailyLimit()) > 0) {
-            log.warn(
-                    "[STEP] Daily limit exceeded for companyId={}, profileId={}",
-                    companyId,
-                    profileId
-            );
+final CustomerEligibilityValidationResult eligibilityResult =
+        parallelResult.get("customerEligibility", CustomerEligibilityValidationResult.class);
 
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    DAILY_LIMIT_EXCEEDED.getCode(),
-                    DAILY_LIMIT_EXCEEDED.getMessage()
-            );
-        }
-    }
-
-    private void loadContextWithLimit(
-            final WorkflowContext context,
-            final ProfileLimit profileLimit,
-            final BigDecimal limitAmount
-    ) {
-        context.put(LIMIT_AMT, limitAmount);
-        context.put(LIMIT_TYPE, profileLimit != null ? profileLimit.getLimitType() : "");
-        context.put(SEG_TYPE, profileLimit != null ? profileLimit.getSegmentType() : "");
-    }
-
-    private void validateRequiredContext(
-            final String companyId,
-            final EnrollmentEntity enrollmentEntity,
-            final GetPayrollResponse payrollResponse,
-            final PayrollEntity payrollEntity,
-            final String payrollId
-    ) {
-        if (companyId == null || companyId.isBlank()) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "MISSING_COMPANY_ID",
-                    "Company id is missing from workflow context"
-            );
-        }
-
-        if (enrollmentEntity == null) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "MISSING_COMPANY_ENROLLMENT",
-                    "Company enrollment is missing from workflow context"
-            );
-        }
-
-        if (payrollResponse == null) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "MISSING_GUSTO_PAYROLL_RESPONSE",
-                    "Gusto payroll response is missing from workflow context"
-            );
-        }
-
-        if (payrollResponse.getPayrollStatusMeta() == null) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "MISSING_PAYROLL_STATUS_META",
-                    "Payroll status metadata is missing from Gusto payroll response"
-            );
-        }
-
-        if (payrollResponse.getTotals() == null || payrollResponse.getTotals().getCompanyDebit() == null) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "MISSING_COMPANY_DEBIT_AMOUNT",
-                    "Company debit amount is missing from Gusto payroll response"
-            );
-        }
-
-        if (payrollEntity == null) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "MISSING_PAYROLL_ENTITY",
-                    "Payroll entity is missing from workflow context"
-            );
-        }
-
-        if (payrollId == null || payrollId.isBlank()) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "MISSING_PAYROLL_ID",
-                    "Payroll id is missing from workflow context"
-            );
-        }
-    }
-
-    private void validateEligibilityResponse(
-            final PaymentCustomerEligibilityResponse eligibilityResponse
-    ) {
-        if (eligibilityResponse == null) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "INVALID_ELIGIBILITY_RESPONSE",
-                    "Customer eligibility response is null"
-            );
-        }
-
-        if (eligibilityResponse.getEnterprisePartyIdentifier() == null ||
-                eligibilityResponse.getEnterprisePartyIdentifier().isBlank()) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "MISSING_ENTERPRISE_PARTY_IDENTIFIER",
-                    "Enterprise party identifier is missing from eligibility response"
-            );
-        }
-
-        if (eligibilityResponse.getUserSegmentIdentifier() == null ||
-                eligibilityResponse.getUserSegmentIdentifier().isBlank()) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "MISSING_USER_SEGMENT_IDENTIFIER",
-                    "User segment identifier is missing from eligibility response"
-            );
-        }
-    }
-
-    private void validateProfileLimit(final ProfileLimit profileLimit) {
-        if (profileLimit == null) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "PROFILE_LIMIT_NOT_FOUND",
-                    "Profile limit was not found"
-            );
-        }
-
-        if (profileLimit.getTransactionLimit() == null) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "TRANSACTION_LIMIT_NOT_FOUND",
-                    "Transaction limit is missing"
-            );
-        }
-
-        if (profileLimit.getDailyLimit() == null) {
-            throw ProcessorException.of(
-                    ProcessorExceptionType.BUSINESS_VALIDATION,
-                    "DAILY_LIMIT_NOT_FOUND",
-                    "Daily limit is missing"
-            );
-        }
-    }
-}
+final ProfileLimit profileLimit =
+        parallelResult.get("profileLimit", ProfileLimit.class);
 
