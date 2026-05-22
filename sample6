@@ -1,0 +1,385 @@
+@Repository
+public interface EnrollmentRepository extends JpaRepository<EnrollmentEntity, String> {
+
+    @NativeQuery("""
+        SELECT *
+        FROM pyrl_enrl.pyrl_enrl
+        WHERE src_co_id IN (:companyIds)
+          AND rel_entp_prty_id IN (:enterprisePartyIds)
+    """)
+    List<EnrollmentEntity> findByCompanyIdsAndEnterprisePartyIds(
+            @Param("companyIds") Set<String> companyIds,
+            @Param("enterprisePartyIds") Set<String> enterprisePartyIds
+    );
+
+    @NativeQuery("""
+        SELECT *
+        FROM pyrl_enrl.pyrl_enrl
+        WHERE pyrl_enrl_id IN (:enrollmentIds)
+    """)
+    List<EnrollmentEntity> findByEnrollmentIdIn(@Param("enrollmentIds") Set<String> enrollmentIds);
+}
+
+@Repository
+public interface PayrollRepository extends JpaRepository<PayrollEntity, PayrollId> {
+
+    @NativeQuery("""
+        SELECT *
+        FROM pyrl_mgmt.pyrl
+        WHERE pyrl_enrl_id IN (:enrollmentIds)
+          AND proc_dt BETWEEN :startDate AND :endDate
+    """)
+    List<PayrollEntity> findByEnrollmentIdsAndDateRange(
+            @Param("enrollmentIds") Set<String> enrollmentIds,
+            @Param("startDate") Timestamp startDate,
+            @Param("endDate") Timestamp endDate
+    );
+}
+
+@Repository
+public interface ContractorPaymentGroupRepository extends JpaRepository<ContractorPaymentGroupEntity, ContractorPaymentGroupId> {
+
+    @NativeQuery("""
+        SELECT *
+        FROM pyrl_mgmt.cntrt_pymt_gp
+        WHERE pyrl_enrl_id IN (:enrollmentIds)
+          AND proc_dt BETWEEN :startDate AND :endDate
+          AND src_cntrt_pymt_gp_id IS NOT NULL
+    """)
+    List<ContractorPaymentGroupEntity> findByEnrollmentIdsAndDateRange(
+            @Param("enrollmentIds") Set<String> enrollmentIds,
+            @Param("startDate") Timestamp startDate,
+            @Param("endDate") Timestamp endDate
+    );
+
+    @NativeQuery("""
+        SELECT *
+        FROM pyrl_mgmt.cntrt_pymt_gp
+        WHERE pyrl_enrl_id = :payrollEnrollmentId
+          AND proc_dt BETWEEN :startDate AND :endDate
+          AND src_cntrt_pymt_gp_id IS NOT NULL
+    """)
+    Optional<List<ContractorPaymentGroupEntity>> findByEnrollmentIdAndDateRange(
+            @Param("payrollEnrollmentId") String payrollEnrollmentId,
+            @Param("startDate") Timestamp startDate,
+            @Param("endDate") Timestamp endDate
+    );
+}
+
+@Repository
+public interface ContractorPaymentRepository extends JpaRepository<ContractorPaymentEntity, ContractorPaymentId> {
+
+    @NativeQuery("""
+        SELECT *
+        FROM pyrl_mgmt.cntrt_pymt
+        WHERE cntrt_pymt_gp_id IN (:groupIds)
+    """)
+    Optional<List<ContractorPaymentEntity>> findByCntrtPymtGpIdIn(
+            @Param("groupIds") Set<String> groupIds
+    );
+}
+
+@Repository
+public interface PayrollTransactionRepository extends JpaRepository<PayrollTransactionEntity, PayrollTransactionId> {
+
+    Optional<List<PayrollTransactionEntity>> findBySourcePayrollId(String srcPyrlId);
+
+    Optional<List<PayrollTransactionEntity>> findBySourcePayrollIdIn(Set<String> srcPyrlIds);
+}
+
+@NativeQuery("""
+    SELECT *
+    FROM pyrl_mgmt.pyrl_txn
+    WHERE src_pyrl_id IN (:srcPyrlIds)
+""")
+Optional<List<PayrollTransactionEntity>> findBySourcePayrollIdIn(
+        @Param("srcPyrlIds") Set<String> srcPyrlIds
+);
+
+@NativeQuery("""
+    SELECT *
+    FROM pyrl_mgmt.emp_txn
+    WHERE pyrl_txn_id IN (:payrollTransactionIds)
+""")
+Optional<List<EmployeeTransactionEntity>> findByPayrollTransactionIdIn(
+        @Param("payrollTransactionIds") Set<String> payrollTransactionIds
+);
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PaymentService {
+
+    private final PayrollRepository payrollRepository;
+    private final ContractorPaymentGroupRepository contractorPaymentGroupRepository;
+    private final PayrollTransactionRepository payrollTransactionRepository;
+    private final EmployeeTransactionRepository employeeTransactionRepository;
+    private final ContractorPaymentRepository contractorPaymentRepository;
+
+    public Map<String, List<Payment>> getPaymentsByPyrlEnrlIdsAndDate(
+            final Set<String> pyrlEnrlIds,
+            final LocalDate startDate,
+            final LocalDate endDate
+    ) {
+        if (pyrlEnrlIds == null || pyrlEnrlIds.isEmpty()) {
+            return Map.of();
+        }
+
+        final Timestamp startTimestamp = Timestamp.valueOf(startDate.atStartOfDay());
+        final Timestamp endTimestamp = Timestamp.valueOf(endDate.atTime(23, 59, 59));
+
+        final Map<String, List<Payment>> response = new HashMap<>();
+
+        final List<PayrollEntity> payrollEntities =
+                payrollRepository.findByEnrollmentIdsAndDateRange(pyrlEnrlIds, startTimestamp, endTimestamp);
+
+        final Map<String, List<String>> payrollPayeeMap = getPayeesForPayrolls(payrollEntities);
+
+        payrollEntities.forEach(entity -> {
+            final String pyrlEnrlId = entity.getPyrlEnrlId(); // adjust if inside entity.getId()
+            final Payment payment = toPayrollPaymentDetails(entity, payrollPayeeMap);
+
+            response.computeIfAbsent(pyrlEnrlId, key -> new ArrayList<>())
+                    .add(payment);
+        });
+
+        final List<ContractorPaymentGroupEntity> contractorPaymentGroups =
+                contractorPaymentGroupRepository.findByEnrollmentIdsAndDateRange(
+                        pyrlEnrlIds,
+                        startTimestamp,
+                        endTimestamp
+                );
+
+        final Map<String, List<ContractorPaymentEntity>> contractorPaymentsByGroupId =
+                getContractorPaymentsByGroupId(contractorPaymentGroups);
+
+        contractorPaymentGroups.forEach(groupEntity -> {
+            final String pyrlEnrlId = groupEntity.getPyrlEnrlId(); // adjust if inside entity/id
+            final List<Payment> contractorPayments =
+                    toContractorPaymentDetails(groupEntity, contractorPaymentsByGroupId);
+
+            response.computeIfAbsent(pyrlEnrlId, key -> new ArrayList<>())
+                    .addAll(contractorPayments);
+        });
+
+        return response;
+    }
+
+    public List<Payment> getPaymentsByPyrlEnrlIdAndDate(
+            final String pyrlEnrlId,
+            final LocalDate startDate,
+            final LocalDate endDate
+    ) {
+        return getPaymentsByPyrlEnrlIdsAndDate(Set.of(pyrlEnrlId), startDate, endDate)
+                .getOrDefault(pyrlEnrlId, List.of());
+    }
+
+    private Payment toPayrollPaymentDetails(
+            final PayrollEntity entity,
+            final Map<String, List<String>> payrollPayeeMap
+    ) {
+        final String srcPyrlId = entity.getId().getSrcPyrlId();
+
+        final LocalDate dlvrDueDt = entity.getDlvrDueDt();
+        final LocalDateTime dlvrDueDtTime = dlvrDueDt != null ? dlvrDueDt.atStartOfDay() : null;
+
+        return Payment.builder()
+                .paymentIdentifier(srcPyrlId)
+                .paymentStatusCode(entity.getPyrlStsCd())
+                .paymentProcessDate(Optional.ofNullable(entity.getId().getProcDt())
+                        .map(LocalDate::toString)
+                        .orElse(""))
+                .lastPaymentPostedDate(Optional.ofNullable(dlvrDueDtTime)
+                        .map(dt -> dt.format(TIMESTAMP_FORMATTER))
+                        .orElse(""))
+                .paymentTypeName(entity.getPyrlDlvrTypeCd())
+                .fundingAccountNumber(entity.getFundAcctNb())
+                .bankIdentifier(entity.getFirmBnkId())
+                .payees(payrollPayeeMap.getOrDefault(srcPyrlId, List.of()))
+                .build();
+    }
+
+    private List<Payment> toContractorPaymentDetails(
+            final ContractorPaymentGroupEntity groupEntity,
+            final Map<String, List<ContractorPaymentEntity>> contractorPaymentsByGroupId
+    ) {
+        final String groupId = groupEntity.getId().getCntrtPymtGpId();
+
+        final List<ContractorPaymentEntity> contractorPayments =
+                contractorPaymentsByGroupId.getOrDefault(groupId, List.of());
+
+        return contractorPayments.stream()
+                .map(contractorPayment -> Payment.builder()
+                        .paymentIdentifier(contractorPayment.getId().getSrcCntrtPymtId())
+                        .paymentStatusCode(contractorPayment.getCntrtPymtStsCd())
+                        .paymentProcessDate(Optional.ofNullable(groupEntity.getId().getProcDt())
+                                .map(LocalDate::toString)
+                                .orElse(""))
+                        .lastPaymentPostedDate(Optional.ofNullable(groupEntity.getDlvrDueDt())
+                                .map(LocalDate::toString)
+                                .orElse(""))
+                        .paymentTypeName(groupEntity.getPymtDlvrTypeCd())
+                        .fundingAccountNumber(groupEntity.getFundAcctNb())
+                        .bankIdentifier(groupEntity.getFirmBnkId())
+                        .payees(List.of(contractorPayment.getSrcPayeeId()))
+                        .build())
+                .collect(Collectors.toList());
+    }
+
+    private Map<String, List<ContractorPaymentEntity>> getContractorPaymentsByGroupId(
+            final List<ContractorPaymentGroupEntity> contractorPaymentGroups
+    ) {
+        if (contractorPaymentGroups == null || contractorPaymentGroups.isEmpty()) {
+            return Map.of();
+        }
+
+        final Set<String> groupIds = contractorPaymentGroups.stream()
+                .map(entity -> entity.getId().getCntrtPymtGpId())
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+
+        if (groupIds.isEmpty()) {
+            return Map.of();
+        }
+
+        final List<ContractorPaymentEntity> contractorPayments =
+                contractorPaymentRepository.findByCntrtPymtGpIdIn(groupIds)
+                        .orElse(List.of());
+
+        return contractorPayments.stream()
+                .collect(Collectors.groupingBy(entity -> entity.getId().getCntrtPymtGpId()));
+    }
+
+    private Map<String, List<String>> getPayeesForPayrolls(final List<PayrollEntity> payrollEntities) {
+        if (payrollEntities == null || payrollEntities.isEmpty()) {
+            return Map.of();
+        }
+
+        final Set<String> srcPyrlIds = payrollEntities.stream()
+                .map(entity -> entity.getId().getSrcPyrlId())
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+
+        if (srcPyrlIds.isEmpty()) {
+            return Map.of();
+        }
+
+        final List<PayrollTransactionEntity> payrollTransactions =
+                payrollTransactionRepository.findBySourcePayrollIdIn(srcPyrlIds)
+                        .orElse(List.of());
+
+        if (payrollTransactions.isEmpty()) {
+            return Map.of();
+        }
+
+        final Map<String, List<String>> payrollTxnIdsBySrcPayrollId = payrollTransactions.stream()
+                .collect(Collectors.groupingBy(
+                        PayrollTransactionEntity::getSrcPyrlId, // adjust if inside id
+                        Collectors.mapping(entity -> entity.getId().getPyrlTxnId(), Collectors.toList())
+                ));
+
+        final Set<String> payrollTxnIds = payrollTransactions.stream()
+                .map(entity -> entity.getId().getPyrlTxnId())
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+
+        final List<EmployeeTransactionEntity> employeeTransactions =
+                employeeTransactionRepository.findByPayrollTransactionIdIn(payrollTxnIds)
+                        .orElse(List.of());
+
+        final Map<String, List<String>> payeeIdsByPayrollTxnId = employeeTransactions.stream()
+                .collect(Collectors.groupingBy(
+                        EmployeeTransactionEntity::getPyrlTxnId, // adjust if inside id
+                        Collectors.mapping(EmployeeTransactionEntity::getSrcPayeeId, Collectors.toList())
+                ));
+
+        final Map<String, List<String>> payeesBySrcPayrollId = new HashMap<>();
+
+        payrollTxnIdsBySrcPayrollId.forEach((srcPayrollId, txnIds) -> {
+            final List<String> payeeIds = txnIds.stream()
+                    .flatMap(txnId -> payeeIdsByPayrollTxnId.getOrDefault(txnId, List.of()).stream())
+                    .filter(Objects::nonNull)
+                    .distinct()
+                    .collect(Collectors.toList());
+
+            payeesBySrcPayrollId.put(srcPayrollId, payeeIds);
+        });
+
+        return payeesBySrcPayrollId;
+    }
+}
+
+@Repository
+public interface PayeeRepository extends JpaRepository<PayeeEntity, PayeeId> {
+
+    @NativeQuery("""
+        SELECT *
+        FROM pyrl_mgmt.payee
+        WHERE src_company_id IN (:pyrlEnrlIds)
+    """)
+    List<PayeeEntity> findAllPayeesByPyrlEnrlIdIn(
+            @Param("pyrlEnrlIds") Set<String> pyrlEnrlIds
+    );
+}
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PayeeService {
+
+    private final PayeeRepository payeeRepository;
+
+    public Map<String, List<Payee>> getAllPayeesForCompanies(final Set<String> pyrlEnrlIds) {
+        if (pyrlEnrlIds == null || pyrlEnrlIds.isEmpty()) {
+            return Map.of();
+        }
+
+        return payeeRepository.findAllPayeesByPyrlEnrlIdIn(pyrlEnrlIds)
+                .stream()
+                .map(this::toPayeeDetailsWithEnrollmentId)
+                .collect(Collectors.groupingBy(
+                        PayeeWithEnrollment::getPyrlEnrlId,
+                        Collectors.mapping(PayeeWithEnrollment::getPayee, Collectors.toList())
+                ));
+    }
+
+    public List<Payee> getAllPayeesForACompany(final String pyrlEnrlId) {
+        return getAllPayeesForCompanies(Set.of(pyrlEnrlId))
+                .getOrDefault(pyrlEnrlId, List.of());
+    }
+
+    private PayeeWithEnrollment toPayeeDetailsWithEnrollmentId(final PayeeEntity entity) {
+        return PayeeWithEnrollment.builder()
+                .pyrlEnrlId(entity.getPyrlEnrlId()) // adjust getter if needed
+                .payee(toPayeeDetails(entity))
+                .build();
+    }
+
+    private Payee toPayeeDetails(final PayeeEntity entity) {
+        final LocalDate hireDt = entity.getHireDt();
+        final LocalDateTime hireDtTime = hireDt != null ? hireDt.atStartOfDay() : null;
+
+        final LocalDate trmnDt = entity.getTrmnDt();
+        final LocalDateTime trmnDtTime = trmnDt != null ? trmnDt.atStartOfDay() : null;
+
+        return Payee.builder()
+                .payeeIdentifier(entity.getSrcPayeeId())
+                .payeeStatusName(entity.getSrcPayeeStsNm())
+                .payeeHireStartDate(Optional.ofNullable(hireDtTime)
+                        .map(dt -> dt.format(TIMESTAMP_FORMATTER))
+                        .orElse(""))
+                .payeeTerminationDate(Optional.ofNullable(trmnDtTime)
+                        .map(dt -> dt.format(TIMESTAMP_FORMATTER))
+                        .orElse(""))
+                .payeeTypeName(entity.getPayeeTypeCd())
+                .build();
+    }
+
+    @Value
+    @Builder
+    private static class PayeeWithEnrollment {
+        String pyrlEnrlId;
+        Payee payee;
+    }
+}
+
