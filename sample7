@@ -1,0 +1,80 @@
+Subject: Action Required: Employee Configuration Data Issue — Null split_amount for Percentage Splits Causing Payroll Processing Failure
+
+Hi Team,
+
+During payroll processing, we encountered a production exception while persisting payroll hierarchy data.
+
+The failure is caused by an employee configuration where split_by is set to Percentage, but the corresponding split_amount is coming through as null.
+
+Based on the current processing logic, when split_by = Percentage, the split_amount is expected to be a valid numeric value. In the employee configurations reviewed so far, we are seeing three possible values for split_amount:
+
+0, 100, and null
+
+The null value is not expected for percentage-based splits and is causing the processor to fail with a NullPointerException.
+
+have attached the employee configuration details for reference. Please review the source employee configuration data and confirm why split_amount is coming as null for percentage-based splits.
+
+Requested action:
+
+Please validate and correct the employee configuration so that all records with split_by = Percentage have a valid split_amount, preferably 0 or 100 as per the expected configuration rules.
+
+Also, please confirm whether null is ever expected from the upstream/source system for percentage splits. If yes, we need a clear business rule on how the processor should interpret it. Otherwise, this should be corrected at the source/configuration level before payroll processing.
+
+Hi Team,
+
+During payroll processing, we encountered a production validation failure caused by an employee configuration that is not aligned with the expected split configuration rules.
+
+The issue is related to employee direct deposit split configuration. For employees where split_by is set to Percentage, the corresponding split_amount is expected to be populated with a valid numeric value. Based on the employee configurations reviewed so far, we are seeing the following values for split_amount:
+
+0
+100
+null
+
+The null value is not expected for percentage-based splits.
+
+The processor failed with the following exception:
+
+Cannot invoke "java.lang.Integer.intValue()" because the return value of 
+"Split.getSplitAmount()" is null
+
+The failure occurs in the percentage calculation logic where the processor attempts to calculate the split transaction amount using split.getSplitAmount().
+
+Current code behavior:
+
+BigDecimal percentage = new BigDecimal(split.getSplitAmount());
+
+Since split_amount is coming as null, the payroll processor is unable to calculate the employee transaction split amount and the validation fails.
+
+Expected configuration:
+
+For employee configurations where:
+
+"split_by": "Percentage"
+
+the split_amount should be populated with a valid value. Based on the current business expectation, it should be either:
+
+0 or 100
+
+Invalid configuration observed:
+
+"split_by": "Percentage",
+"split_amount": null
+
+Because the employee configuration is not valid, the payroll cannot be safely processed. Also, we are not keeping the payroll in a limbo or partially processed state. Since the validation error occurs during processing, the payroll is being cancelled in Gusto as part of the current handling flow.
+
+This cancellation is intentional to avoid leaving the payroll in an inconsistent state between our processor and Gusto.
+
+Requested action:
+
+Please review the attached employee configuration details and validate why split_amount is coming as null for percentage-based split configurations.
+
+Please confirm whether null is ever expected from the upstream/source system for split_by = Percentage.
+
+If null is not expected, the employee configuration should be corrected at the source so that all percentage-based splits have a valid split_amount, preferably 0 or 100 as per the expected configuration rule.
+
+If null is expected in any scenario, we need a clearly defined business rule on how the processor should interpret it before allowing the payroll to proceed.
+
+Until this configuration issue is corrected or clarified, the payroll will continue to fail validation and will be cancelled in Gusto to prevent the payroll from remaining in a limbo state.
+
+Thanks,
+Kasi
